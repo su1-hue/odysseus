@@ -77,10 +77,13 @@ def _bind_mode(argv, dest):
 
 # ── what the namespace binds ────────────────────────────────────────────────
 @pytest.mark.skipif(os.name == "nt", reason="bwrap argv is POSIX-only")
-def test_home_and_mnt_are_read_only(workspace):
+def test_mnt_is_read_only_and_home_is_never_bound(workspace):
+    """/home must not be bound at all, read-only or not: per-user agent
+    workspaces live under /home, so a /home bind (even ro) would let one
+    user's agent read every other user's workspace. /mnt stays read-only."""
     argv = _argv(workspace)
-    assert _bind_mode(argv, "/home") == "--ro-bind"
     assert _bind_mode(argv, "/mnt") == "--ro-bind"
+    assert _bind_mode(argv, "/home") is None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="bwrap argv is POSIX-only")
@@ -97,9 +100,9 @@ def test_the_workspace_stays_writable_at_its_real_host_path_too(workspace):
     BashTool's /tmp redirect rewrites `/tmp/` to `<agent_cwd()>/.tmp/` before
     the namespace is built, so the command bwrap receives already names the real
     path. Those writes used to land because the workspace happened to sit under
-    the writable `/home` bind. With /home read-only they need the workspace's
-    own bind, or making /home read-only silently breaks every command that uses
-    a real host path.
+    a broad host bind. With /home never bound at all they need the workspace's
+    own bind, or dropping the broad bind silently breaks every command that
+    uses a real host path.
     """
     real = os.path.realpath(workspace)
     argv = _argv(workspace)
@@ -112,17 +115,20 @@ def test_the_workspace_stays_writable_at_its_real_host_path_too(workspace):
 def test_no_dir_chain_is_created_inside_a_read_only_bind(monkeypatch, tmp_path):
     """mkdir inside a read-only mount fails and takes the namespace with it.
 
-    A workspace under `/home` or `/mnt` already has its parents, because the
-    argv mounted those roots. Emitting `--dir /home/someone` for it would be an
-    error, not a no-op.
+    A path under `/mnt` or `/usr` already has its parents, because the argv
+    mounted those roots. Emitting `--dir` for them would be an error, not a
+    no-op. `/home` is not a mounted root (it holds every user's workspace),
+    so paths under it get a normal `--dir` chain in the private tmpfs root.
     """
-    assert subprocess_tools._namespace_dir_chain("/home/someone/ws") == []
     assert subprocess_tools._namespace_dir_chain("/mnt/data/ws") == []
     assert subprocess_tools._namespace_dir_chain("/usr/share/ws") == []
     # Somewhere the argv does not mount: the parents have to be created in the
     # private tmpfs root.
     assert subprocess_tools._namespace_dir_chain("/srv/agents/ws") == [
         "--dir", "/srv", "--dir", "/srv/agents",
+    ]
+    assert subprocess_tools._namespace_dir_chain("/home/someone/ws") == [
+        "--dir", "/home", "--dir", "/home/someone",
     ]
 
 

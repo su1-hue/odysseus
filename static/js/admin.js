@@ -68,6 +68,12 @@ const PRIV_LABELS = {
 async function loadUsers() {
   const list = el('adm-userList');
   try {
+    // Who is viewing (the real admin; the panel is only reachable by them).
+    let me = '';
+    try {
+      const st = await fetch('/api/auth/status', { credentials: 'same-origin' }).then(r => (r.ok ? r.json() : null));
+      me = (st && st.username) || '';
+    } catch (_) {}
     const res = await fetch('/api/auth/users', { credentials: 'same-origin' });
     if (res.status === 401 || res.status === 403) { list.innerHTML = '<div class="admin-empty">Access denied</div>'; return; }
     const data = await res.json();
@@ -92,6 +98,8 @@ async function loadUsers() {
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <button class="admin-btn-sm" data-adm-toggle-admin="${esc(u.username)}" data-make-admin="${u.is_admin ? '0' : '1'}" style="font-size:11px;">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>
           <button class="admin-btn-sm" data-adm-rename-user="${esc(u.username)}" style="font-size:11px;">Rename</button>
+          ${me && u.username !== me ? `<button class="admin-btn-sm" data-adm-view-as="${esc(u.username)}" style="font-size:11px;">View as</button>` : ''}
+          <button class="admin-btn-sm" data-adm-ws-files="${esc(u.username)}" style="font-size:11px;">Workspace</button>
           ${u.is_admin ? '' : '<button class="admin-btn-sm" data-adm-reset-password style="font-size:11px;">Change password</button>'}
           ${u.is_admin ? '' : `<button class="admin-btn-delete" data-adm-del-user="${esc(u.username)}" style="font-size:11px;">Remove</button>`}
           ${u.is_admin ? '' : '<svg class="admin-user-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.3;transition:transform 0.2s,opacity 0.2s;"><polyline points="6 9 12 15 18 9"/></svg>'}
@@ -150,7 +158,7 @@ async function loadUsers() {
         // Toggle panel visibility + rotate chevron + load models
         let _modelsLoaded = false;
         header.addEventListener('click', (e) => {
-          if (e.target.closest('.admin-btn-delete, [data-adm-rename-user], [data-adm-toggle-admin], [data-adm-reset-password]')) return;
+          if (e.target.closest('.admin-btn-delete, [data-adm-rename-user], [data-adm-toggle-admin], [data-adm-reset-password], [data-adm-view-as], [data-adm-ws-files]')) return;
           privPanel.classList.toggle('hidden');
           const chevron = header.querySelector('.admin-user-chevron');
           if (chevron) {
@@ -243,6 +251,113 @@ async function loadUsers() {
           } catch (err) {
             uiModule.showError('Failed to rename user');
           }
+        });
+      }
+
+      // Workspace button — admin-only cross-user workspace browser (G2).
+      // "Viewing as <user>" panel: lists the user's agent workspace and
+      // previews small files. Server-side routes 404 non-admins and
+      // impersonating admins; every successful call is audit-logged.
+      const wsPanel = document.createElement('div');
+      wsPanel.className = 'admin-priv-panel hidden';
+      wsPanel.style.cssText = 'padding:8px 0 4px;border-top:1px solid var(--border);margin-top:8px;max-height:320px;overflow-y:auto;';
+      row.appendChild(wsPanel);
+      let wsPath = '';
+      async function renderWs() {
+        wsPanel.innerHTML = '<div style="font-size:11px;opacity:0.4;padding:4px 0;">Loading…</div>';
+        let res;
+        try {
+          const qs = wsPath ? `?path=${encodeURIComponent(wsPath)}` : '';
+          res = await fetch(`/api/admin/workspaces/${encodeURIComponent(u.username)}/files${qs}`, { credentials: 'same-origin' });
+        } catch {
+          wsPanel.innerHTML = '<div style="font-size:11px;opacity:0.4;padding:4px 0;">Failed to load</div>';
+          return;
+        }
+        if (!res.ok) {
+          wsPanel.innerHTML = `<div style="font-size:11px;opacity:0.4;padding:4px 0;">Not accessible (${res.status})</div>`;
+          return;
+        }
+        const data = await res.json().catch(() => null);
+        if (!data) {
+          wsPanel.innerHTML = '<div style="font-size:11px;opacity:0.4;padding:4px 0;">Failed to load</div>';
+          return;
+        }
+        let html = `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">
+          <span style="font-size:11px;font-weight:600;">Workspace — Viewing as ${esc(data.viewing_as)}${wsPath ? ` / ${esc(wsPath)}` : ''}</span>`;
+        if (wsPath) html += '<button class="admin-btn-sm" data-ws-up style="font-size:10px;">↑ Up</button>';
+        html += '</div>';
+        if (!data.entries || data.entries.length === 0) {
+          html += '<div style="font-size:11px;opacity:0.4;padding:4px 0;">(empty)</div>';
+        } else {
+          for (const entry of data.entries) {
+            const label = entry.is_dir
+              ? `${esc(entry.name)}/`
+              : `${esc(entry.name)} <span style="opacity:0.4;font-size:10px;">${entry.size} B</span>`;
+            html += `<div class="ws-entry" data-ws-name="${esc(entry.name)}" data-ws-dir="${entry.is_dir ? '1' : '0'}" style="padding:3px 6px;font-size:12px;cursor:pointer;border-radius:4px;">${label}${entry.is_symlink ? ' <span style="opacity:0.4;font-size:10px;">(link)</span>' : ''}</div>`;
+          }
+          if (data.truncated) html += '<div style="font-size:10px;opacity:0.4;padding:4px 0;">(list truncated)</div>';
+        }
+        wsPanel.innerHTML = html;
+        wsPanel.querySelector('[data-ws-up]')?.addEventListener('click', () => {
+          const parts = wsPath.split('/').filter(Boolean);
+          parts.pop();
+          wsPath = parts.join('/');
+          renderWs();
+        });
+        wsPanel.querySelectorAll('.ws-entry').forEach((el) => {
+          el.addEventListener('click', async () => {
+            const name = el.dataset.wsName;
+            if (el.dataset.wsDir === '1') {
+              wsPath = wsPath ? `${wsPath}/${name}` : name;
+              renderWs();
+              return;
+            }
+            const p = wsPath ? `${wsPath}/${name}` : name;
+            el.style.opacity = '0.5';
+            try {
+              const r = await fetch(`/api/admin/workspaces/${encodeURIComponent(u.username)}/files/raw?path=${encodeURIComponent(p)}`, { credentials: 'same-origin' });
+              if (!r.ok) {
+                el.style.opacity = '1';
+                uiModule.showError(`Cannot preview (${r.status})`);
+                return;
+              }
+              const f = await r.json().catch(() => null);
+              if (!f) { el.style.opacity = '1'; uiModule.showError('Cannot preview'); return; }
+              const text = f.encoding === 'base64' ? '(binary file)' : f.content;
+              wsPanel.insertAdjacentHTML('beforeend', `<pre style="margin:6px 0 0;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;">${esc(text)}</pre>`);
+              wsPanel.scrollTop = wsPanel.scrollHeight;
+            } catch { el.style.opacity = '1'; uiModule.showError('Cannot preview'); }
+          });
+        });
+      }
+      const wsBtn = row.querySelector('[data-adm-ws-files]');
+      wsBtn?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        wsPanel.classList.toggle('hidden');
+        if (!wsPanel.classList.contains('hidden')) renderWs();
+      });
+
+      // View-as button — admin impersonation. Starts "Viewing as <user>":
+      // every request runs as that user until stopped (banner in init.js).
+      const viewBtn = row.querySelector('[data-adm-view-as]');
+      if (viewBtn) {
+        viewBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const username = viewBtn.dataset.admViewAs;
+          if (!await uiModule.styledConfirm(`View Odysseus as "${username}"? You'll see exactly what they see until you stop.`, { confirmText: 'View as' })) return;
+          viewBtn.disabled = true;
+          try {
+            const res = await fetch('/api/admin/impersonate', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { uiModule.showError(data.detail || 'Failed to start impersonation'); return; }
+            window.location.reload();
+          } catch { uiModule.showError('Failed to start impersonation'); }
+          finally { viewBtn.disabled = false; }
         });
       }
 

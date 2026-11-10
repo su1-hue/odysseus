@@ -282,6 +282,30 @@ class AuthManager:
         logger.info(f"Created user '{username}' (admin={is_admin})")
         return True
 
+    def update_sso_metadata(self, username: str, *, sub: str, email: str,
+                            groups: List[str], is_admin: bool) -> bool:
+        """Record/refresh SSO identity metadata on an existing user.
+
+        SSO mode makes the identity provider the source of truth for the admin
+        role, so is_admin is recomputed on every login (group changes in
+        Authentik take effect at next login without touching auth.json).
+        """
+        username = username.strip().lower()
+        with self._config_lock:
+            user = self._config.get("users", {}).get(username)
+            if user is None:
+                return False
+            user["is_admin"] = bool(is_admin)
+            user["sso"] = {
+                "sub": sub,
+                "email": email,
+                "groups": list(groups),
+                "first_sso": user.get("sso", {}).get("first_sso", time.time()),
+                "last_sso": time.time(),
+            }
+            self._save()
+        return True
+
     def delete_user(self, username: str, requesting_user: str) -> bool:
         """Delete a user. Only admins can delete, and can't delete themselves.
 
@@ -678,6 +702,46 @@ class AuthManager:
             if revoked:
                 self._save_sessions()
         return revoked
+
+    def get_session(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Return a COPY of the raw session record for a valid token, or None.
+
+        Used by the middleware for impersonation bookkeeping; the copy means
+        callers can never mutate the live session dict.
+        """
+        if not token:
+            return None
+        with self._sessions_lock:
+            session = self._sessions.get(token)
+            if session is None:
+                return None
+            if time.time() > session["expiry"]:
+                return None
+            if session.get("username") not in self.users:
+                return None
+            return dict(session)
+
+    def set_impersonating(self, token: str, target_username: str) -> bool:
+        """Mark a session as viewing as ``target_username`` (admin only,
+        enforced by callers). Persisted so it survives process restarts."""
+        if not token or not target_username:
+            return False
+        with self._sessions_lock:
+            session = self._sessions.get(token)
+            if session is None:
+                return False
+            session["impersonating"] = target_username.strip().lower()
+            self._save_sessions()
+        return True
+
+    def clear_impersonating(self, token: str) -> bool:
+        with self._sessions_lock:
+            session = self._sessions.get(token)
+            if session is None or "impersonating" not in session:
+                return False
+            session.pop("impersonating", None)
+            self._save_sessions()
+        return True
 
     def status(self, token: Optional[str]) -> Dict[str, Any]:
         username = self.get_username_for_token(token)

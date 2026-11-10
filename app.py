@@ -313,6 +313,12 @@ if AUTH_ENABLED:
         "/api/health",
         "/api/version",
         "/login",
+        # SSO entry points authenticate against the identity provider, not a
+        # local session cookie: /auth/login must be reachable unauthenticated
+        # (it starts the redirect), and /auth/callback arrives with the
+        # browser's OLD (absent/stale) cookie plus the provider's code.
+        "/auth/login",
+        "/auth/callback",
     }
     AUTH_EXEMPT_PREFIXES = ["/static"]
     # Dynamic paths whose own handler proves identity via a path-embedded
@@ -520,6 +526,24 @@ if AUTH_ENABLED:
             # Attach current username to request state for downstream routes
             request.state.current_user = auth_manager.get_username_for_token(token)
             request.state.api_token = False
+            # Admin impersonation ("View as <user>"): when the session record
+            # carries an impersonation target and the account owning the
+            # cookie is still an admin, downstream routes see the TARGET's
+            # identity (their data, their privileges). The real admin is kept
+            # in request.state.admin_actual_user for the impersonation
+            # controls and the audit log. A stale target (user deleted, or
+            # admin rights revoked while impersonating) is dropped so the
+            # session falls back to the real identity instead of running as
+            # a non-existent user.
+            _session = auth_manager.get_session(token)
+            if _session and _session.get("impersonating"):
+                _target = _session["impersonating"]
+                _actual = request.state.current_user
+                if _actual and auth_manager.is_admin(_actual) and _target in auth_manager.users:
+                    request.state.admin_actual_user = _actual
+                    request.state.current_user = _target
+                else:
+                    auth_manager.clear_impersonating(token)
             return await call_next(request)
 
     app.add_middleware(AuthMiddleware)
@@ -717,6 +741,16 @@ webhook_manager = WebhookManager(api_key_manager=api_key_manager)
 # Auth
 auth_router = setup_auth_routes(auth_manager)
 app.include_router(auth_router)
+
+# SSO (Authentik OIDC) + admin impersonation. login/callback no-op with 404
+# when SSO_ENABLED is not true; the admin endpoints are gated to real admins.
+from routes.sso_routes import setup_sso_routes
+app.include_router(setup_sso_routes(auth_manager))
+
+# Admin-only cross-user agent-workspace browsing (G2): every call is
+# audit-logged, impersonating admins and non-admins get 404.
+from routes.admin_workspace_routes import setup_admin_workspace_routes
+app.include_router(setup_admin_workspace_routes(auth_manager))
 
 
 @app.post("/api/activity/heartbeat")
@@ -1030,6 +1064,11 @@ async def serve_backgrounds(request: Request):
 async def serve_login(request: Request):
     if not AUTH_ENABLED:
         return RedirectResponse(url="/", status_code=302)
+    # In SSO mode the local password form is retired: the only entry point
+    # is the identity provider. /auth/login 302s to Authentik.
+    from core import sso as _sso
+    if _sso.sso_enabled():
+        return RedirectResponse(url="/auth/login", status_code=302)
     return serve_html_with_nonce(request, abs_join(BASE_DIR, "static/login.html"))
 
 @app.get("/api/version")

@@ -60,9 +60,14 @@ document.addEventListener('DOMContentLoaded', markComposerUserEdited, { once: tr
     const data = await res.json().catch(() => ({}));
     const liveUser = (data && data.username) || '';
     if (!liveUser) return;
+    // While an admin is "Viewing as <user>", username is the TARGET user.
+    // The cached-state wipe must track the REAL signed-in account, so
+    // starting/stopping impersonation does not trash the admin's drafts
+    // and session caches.
+    const identityUser = (data && data.real_username) || liveUser;
     const KEY = 'odysseus-auth-user';
     const cachedUser = localStorage.getItem(KEY);
-    if (cachedUser && cachedUser !== liveUser) {
+    if (cachedUser && cachedUser !== identityUser) {
       const _keepKeys = new Set(['odysseus-last-user', KEY]);
       const toRemove = [];
       for (let i = 0; i < localStorage.length; i++) {
@@ -73,7 +78,7 @@ document.addEventListener('DOMContentLoaded', markComposerUserEdited, { once: tr
       sessionStorage.clear();
       clearFreshComposerRestore();
     }
-    localStorage.setItem(KEY, liveUser);
+    localStorage.setItem(KEY, identityUser);
     // Apply per-user privilege gates to the UI. The backend enforces these
     // independently — this is purely cosmetic / "don't dangle controls the
     // user can't actually use." Privileges come from /api/auth/status; admins
@@ -100,6 +105,51 @@ document.addEventListener('DOMContentLoaded', markComposerUserEdited, { once: tr
         if (_chat) { _chat.classList.add('active'); _chat.click?.(); }
       }
     } catch (_) { /* DOM not ready or unexpected shape — UI gates are non-fatal */ }
+    // Admin impersonation banner. While /api/auth/status says this session
+    // is "Viewing as <user>", show a persistent top strip with the persona
+    // and the real account, plus a Stop control. Server-side the identity
+    // swap is real (every request runs as the target); the banner is the
+    // visible proof of it and the way out.
+    try {
+      if (data && data.impersonating && data.real_is_admin) {
+        const host = document.body || document.documentElement;
+        if (!host.getElementById('admin-impersonation-banner')) {
+          const banner = document.createElement('div');
+          banner.id = 'admin-impersonation-banner';
+          banner.setAttribute('role', 'status');
+          banner.style.cssText = [
+            'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+            'display:flex', 'align-items:center', 'justify-content:center', 'gap:14px',
+            'flex-wrap:wrap', 'padding:8px 16px', 'background:#b45309', 'color:#fff',
+            'font:13px/1.4 system-ui,-apple-system,sans-serif',
+            'box-shadow:0 2px 10px rgba(0,0,0,.4)',
+          ].join(';');
+          const label = document.createElement('span');
+          label.textContent = `Viewing as ${data.impersonating}` +
+            (data.real_username ? ` — signed in as ${data.real_username}` : '');
+          const stopBtn = document.createElement('button');
+          stopBtn.type = 'button';
+          stopBtn.textContent = 'Stop viewing';
+          stopBtn.style.cssText =
+            'cursor:pointer;border:1px solid rgba(255,255,255,.7);border-radius:6px;' +
+            'background:rgba(0,0,0,.25);color:#fff;font:inherit;padding:3px 12px;';
+          stopBtn.addEventListener('click', async () => {
+            stopBtn.disabled = true;
+            stopBtn.textContent = 'Stopping…';
+            try {
+              await fetch('/api/admin/impersonate/stop', {
+                method: 'POST',
+                credentials: 'same-origin',
+              });
+            } catch (_) { /* reload re-reads status either way */ }
+            window.location.reload();
+          });
+          banner.appendChild(label);
+          banner.appendChild(stopBtn);
+          host.insertBefore(banner, host.firstChild);
+        }
+      }
+    } catch (_) { /* banner is non-fatal */ }
   } catch (_) { /* anonymous / loopback mode — nothing to do */ }
 })();
 

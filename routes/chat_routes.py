@@ -3624,6 +3624,16 @@ def setup_chat_routes(
             ) == "spec"
         except Exception:
             _spec_surface = False
+        # G2: an impersonating admin driving an agent turn as another user is
+        # cross-user access to that user's workspace — audit it per turn.
+        _real_admin = getattr(request.state, "admin_actual_user", None)
+        if _real_admin and _user and _user != _real_admin:
+            from core.isolation import audit
+            audit(
+                "admin_cross_user_access", request,
+                actor=_real_admin, resource_owner=_user,
+                what="agent_workspace_turn", session_id=session,
+            )
         _request_authority = request_authority_for_http(
             request, message, owner=_user, session_id=session, workspace=workspace,
             history=_turn_history, policy=tool_policy,

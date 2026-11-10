@@ -1070,8 +1070,11 @@ def _resolve_tool_path(raw_path: str) -> str:
     expanded = os.path.expanduser(str(raw_path).strip())
     # Relative paths resolve where bash/python run (agent_cwd), not against
     # the server's cwd, which is outside the allowed roots (#6679).
+    # For turns with a real owner that is their per-user workspace, so
+    # relative writes land in the owner's tree, never the shared root.
     if not os.path.isabs(expanded):
-        expanded = os.path.join(_AGENT_WORKDIR, expanded)
+        base = _owner_workspace_dir(get_active_owner()) or _AGENT_WORKDIR
+        expanded = os.path.join(base, expanded)
     resolved = os.path.realpath(expanded)
 
     if _is_app_state_path(resolved):
@@ -1153,11 +1156,57 @@ def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
 _active_workspace: contextvars.ContextVar = contextvars.ContextVar(
     "agent_active_workspace", default=None
 )
+# The owner (authenticated username) of the turn executing tools, set in
+# execute_tool_block next to _active_workspace. Drives per-user workspace
+# isolation so one user's agent files never land in another user's tree.
+_active_owner: contextvars.ContextVar = contextvars.ContextVar(
+    "agent_active_owner", default=None
+)
 
 
 def get_active_workspace() -> Optional[str]:
     """The folder the agent is confined to this turn, or None."""
     return _active_workspace.get()
+
+
+def get_active_owner() -> Optional[str]:
+    """The owner of the turn executing tools, or None outside a block."""
+    return _active_owner.get()
+
+
+def _owner_workspace_dir(owner: Optional[str]) -> Optional[str]:
+    """Per-user agent workspace folder under the shared agent workspace, or
+    None when no isolated bucket applies (owner absent, a request sentinel,
+    or a name that is not a single safe path component).
+
+    The folder name is the raw username so it matches auth.json keys and DB
+    owner values exactly; anything with a path separator, a dot-component, or
+    an empty result falls back to the shared root rather than risk escaping
+    it (a ".." component is rejected by the dirname check as well).
+    """
+    if not owner:
+        return None
+    from src.owner_identity import is_request_sentinel_owner
+    if is_request_sentinel_owner(owner):
+        return None
+    name = str(owner).strip()
+    if (
+        not name
+        or name in (".", "..")
+        or os.sep in name
+        or (os.altsep and os.altsep in name)
+        or name.startswith("~")
+    ):
+        return None
+    base = os.path.realpath(_AGENT_WORKDIR)
+    candidate = os.path.realpath(os.path.join(base, name))
+    # Must be a DIRECT child of the shared workspace root: a symlink or
+    # crafted name that resolves elsewhere is refused, not followed.
+    if os.path.dirname(candidate) != base:
+        return None
+    if _is_sensitive_path(candidate) or _is_denied_tool_path(candidate):
+        return None
+    return candidate
 
 
 def _display_tool_path(path: str) -> str:
@@ -1230,11 +1279,55 @@ def agent_cwd() -> str:
 
 def default_agent_workspace() -> str:
     """The agent workspace under the data dir, where subprocesses run when no
-    workspace is bound."""
+    workspace is bound.
+
+    Owner-aware: a turn carrying a real owner runs in
+    ``data/agent_workspace/<owner>`` (created on demand) so each user's agent
+    files stay in their own tree. Ownerless turns and request sentinels keep
+    the shared root exactly as before."""
+    owner_dir = ensure_owner_workspace(get_active_owner())
+    if owner_dir is not None:
+        return owner_dir
     resolved = os.path.realpath(_AGENT_WORKDIR)
     if resolved not in _agent_readable_data_subdirs() or vet_workspace(resolved) != resolved:
         raise RuntimeError("agent workspace is not a safe real directory")
     return resolved
+
+
+def ensure_owner_workspace(owner: Optional[str]) -> Optional[str]:
+    """Create (or fix up) the per-user agent workspace, owner-only (0700).
+
+    Returns the canonical directory, or None when no isolated bucket
+    applies to this owner (absent, sentinel, or unsafe name). Idempotent:
+    a directory created earlier with the service umask (0755/0775,
+    world-readable) is tightened to owner-only on every call, so the
+    permission guarantee does not depend on how the folder first appeared.
+    """
+    owner_dir = _owner_workspace_dir(owner)
+    if owner_dir is None:
+        return None
+    os.makedirs(owner_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(owner_dir, 0o700)
+    except OSError:
+        pass
+    if vet_workspace(owner_dir) != owner_dir:
+        raise RuntimeError("per-user agent workspace is not a safe real directory")
+    return owner_dir
+
+
+def provision_user_workspace(owner: str) -> None:
+    """Best-effort first-login provisioning of the per-user workspace.
+
+    Called from the login paths (SSO + local) so the folder exists with
+    safe permissions before the user's first agent turn. Never raises:
+    login must not fail on workspace provisioning — the on-demand path
+    (ensure_owner_workspace) recreates it if needed.
+    """
+    try:
+        ensure_owner_workspace(owner)
+    except Exception:
+        logger.warning("Could not provision agent workspace for %r", owner, exc_info=True)
 
 
 def get_mcp_manager():
@@ -1266,6 +1359,15 @@ def _resolve_search_root(raw_path: str) -> str:
         # bare ls listed whatever the workspace was bound to.
         return _resolve_tool_path_in_workspace(ws, raw or ws)
     if not raw:
+        # Per-user default: grep/glob/ls with no path list the OWNER's own
+        # workspace, never the shared root (which would leak other users'
+        # agent files into the model's context).
+        owner_dir = ensure_owner_workspace(get_active_owner())
+        if owner_dir is not None:
+            default_root = os.path.realpath(owner_dir)
+            if vet_workspace(default_root) != default_root:
+                raise ValueError("default agent workspace is not a safe readable data subdirectory")
+            return default_root
         roots = _tool_path_roots()
         default_root = os.path.realpath(AGENT_WORKSPACE_DIR)
         if default_root in roots and not _is_denied_tool_path(default_root):
@@ -1554,7 +1656,12 @@ def _agent_subprocess_env() -> dict:
     }
     base.setdefault("PATH", os.environ.get("PATH") or os.defpath or "/usr/local/bin:/usr/bin:/bin")
     base.setdefault("LANG", "C.UTF-8")
-    base.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40", "HOME": _AGENT_WORKDIR})
+    # HOME follows the per-user workspace for owned turns (dotfiles such as
+    # .bash_history or tool caches then stay in the owner's tree); ownerless
+    # turns keep the shared root as before.
+    owner_dir = ensure_owner_workspace(get_active_owner())
+    base.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40",
+                 "HOME": owner_dir or _AGENT_WORKDIR})
     return base
 
 
@@ -1932,6 +2039,7 @@ async def execute_tool_block(
             )
 
     token = _active_workspace.set(workspace or None)
+    owner_token = _active_owner.set(owner or None)
     try:
         backend_operation.validate(client_runtime_context)
         if process_operation is not None and approval_claimed:
@@ -1971,6 +2079,7 @@ async def execute_tool_block(
             "failure_kind": "resource_identity_denied",
         }
     finally:
+        _active_owner.reset(owner_token)
         _active_workspace.reset(token)
 
 

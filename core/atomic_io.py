@@ -75,6 +75,9 @@ def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = None) -> 
             json.dump(data, f, indent=indent)
             f.flush()
             os.fsync(f.fileno())
+        # Persisted state may hold credentials (session tokens, password
+        # hashes); never leave it world/group-readable regardless of umask.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
         # Directly unlink to avoid a check-then-act race condition.
@@ -96,6 +99,7 @@ def atomic_write_text(path: str, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
         # Directly unlink to avoid a check-then-act race condition.

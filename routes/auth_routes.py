@@ -42,6 +42,20 @@ from src.integrations import (
 logger = logging.getLogger(__name__)
 
 
+def _provision_workspace_safe(username: str) -> None:
+    """Best-effort per-user agent workspace provisioning at login (G1).
+
+    Never raises: a provisioning failure must not block login; the workspace
+    is recreated lazily on the first agent turn if needed.
+    """
+    try:
+        from src.tool_execution import provision_user_workspace
+
+        provision_user_workspace(username)
+    except Exception:
+        logger.warning("Could not provision agent workspace for %r", username, exc_info=True)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -148,6 +162,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     @router.post("/setup")
     async def first_run_setup(body: SetupRequest, request: Request):
         """Create initial admin account. Only works if no accounts exist."""
+        from core import sso as _sso
+        if _sso.sso_enabled():
+            raise HTTPException(403, "Local accounts are disabled — sign in with SSO")
         if not _setup_limiter.check(request.client.host):
             raise HTTPException(429, "Too many requests — try again later")
         if auth_manager.is_configured:
@@ -166,6 +183,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     @router.post("/signup")
     async def signup(body: SignupRequest, request: Request):
         """Create a new user account. Only works if signup is enabled by admin."""
+        from core import sso as _sso
+        if _sso.sso_enabled():
+            raise HTTPException(403, "Local accounts are disabled — sign in with SSO")
         if not _signup_limiter.check(request.client.host):
             raise HTTPException(429, "Too many requests — try again later")
         if not auth_manager.is_configured:
@@ -185,6 +205,11 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     @router.post("/login")
     async def login(body: LoginRequest, request: Request, response: Response):
+        from core import sso as _sso
+        if _sso.sso_enabled():
+            # SSO is the only login path; the local form is retired. Answer
+            # 403 (not a redirect) because this is a JSON API endpoint.
+            raise HTTPException(403, "Local password login is disabled — sign in with SSO")
         if not _login_limiter.check(request.client.host):
             raise HTTPException(429, "Too many requests — try again later")
         # Verify password first
@@ -202,6 +227,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         token = await asyncio.to_thread(auth_manager.create_session_trusted, username)
         if not token:
             raise HTTPException(401, "Invalid credentials")
+        # Ensure the per-user agent workspace exists (0700, owner-only) so the
+        # first agent turn never races a late mkdir (workspace isolation G1).
+        await asyncio.to_thread(_provision_workspace_safe, username)
         cookie_kwargs = dict(
             key=SESSION_COOKIE,
             value=token,
@@ -238,6 +266,32 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 result["privileges"] = auth_manager.get_privileges(u)
         except Exception:
             pass
+        # SSO + impersonation state. When an admin is "Viewing as <user>",
+        # username/is_admin/privileges reflect the EFFECTIVE user (the
+        # target) so the front-end applies the right gates; real_is_admin
+        # tells the UI it may render the impersonation banner + stop
+        # control. Server-side, every admin endpoint re-checks the real
+        # identity from the session cookie.
+        from core import sso as _sso
+        result["sso_enabled"] = _sso.sso_enabled()
+        result["impersonating"] = None
+        result["real_is_admin"] = bool(result.get("is_admin"))
+        result["real_username"] = result.get("username")
+        if token:
+            _session = auth_manager.get_session(token)
+            if _session and _session.get("impersonating"):
+                _actual = result.get("username")
+                _target = _session["impersonating"]
+                if _actual and auth_manager.is_admin(_actual) and _target in auth_manager.users:
+                    result["impersonating"] = _target
+                    result["real_is_admin"] = True
+                    result["real_username"] = _actual
+                    result["username"] = _target
+                    result["is_admin"] = auth_manager.is_admin(_target)
+                    try:
+                        result["privileges"] = auth_manager.get_privileges(_target)
+                    except Exception:
+                        pass
         return result
 
     @router.get("/policy")

@@ -237,14 +237,21 @@ def _replace_workspace_alias(content: str, cwd: str) -> str:
 #: already reachable inside the namespace, so it needs no bind and must not get
 #: a ``--dir`` chain: mkdir inside a read-only bind fails and takes the whole
 #: namespace with it.
-_NAMESPACE_MOUNTED_ROOTS = ("/usr", "/home", "/mnt")
+#:
+#: ``/home`` is deliberately NOT a mounted root: per-user agent workspaces
+#: live under ``/home/...`` (one directory per user), so binding ``/home`` —
+#: even read-only — would let one user's agent read every other user's
+#: workspace. Anything under ``/home`` a command legitimately needs (the
+#: Python venv) is named explicitly as a narrow read-only bind instead.
+_NAMESPACE_MOUNTED_ROOTS = ("/usr", "/mnt")
 
 #: Destinations a bind must never overlay. Replacing the private root, the
 #: private /tmp or the workspace mount with a host directory undoes the
-#: namespace from inside the argv that builds it.
+#: namespace from inside the argv that builds it. ``/home`` stays reserved
+#: explicitly (it is no longer covered by the mounted-roots expansion above).
 _NAMESPACE_RESERVED_DESTS = frozenset({
     "/", "/tmp", "/var", "/opt", "/etc", WORKSPACE_MOUNT,
-    "/root", "/run", "/proc", "/dev", "/sys", *_NAMESPACE_MOUNTED_ROOTS,
+    "/root", "/run", "/proc", "/dev", "/sys", "/home", *_NAMESPACE_MOUNTED_ROOTS,
 })
 
 
@@ -459,7 +466,10 @@ def _wrap_workspace_namespace(
     """
     if IS_WINDOWS or not containment._bwrap_available():
         return None
-    readonly = [path for path in ("/home", "/mnt") if os.path.isdir(path)]
+    # /home is never bound: it contains every user's agent workspace. Only
+    # /mnt is exposed read-only, and the interpreter environment is named
+    # explicitly below.
+    readonly = [path for path in ("/mnt",) if os.path.isdir(path)]
     # setup-python installs interpreters under /opt, and local CI virtualenvs
     # can live under /tmp. Those paths are hidden by the private root/tmpfs.
     # Expose only the active interpreter environment, read-only, so Python
