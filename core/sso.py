@@ -346,11 +346,11 @@ def _sanitize_username_fallback(sub: str) -> str:
 def identity_from_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
     """Map verified ID-token claims to local identity + role.
 
-    Raises SSOError when the user is in neither odysseus group: the
-    Authentik application policy is the primary gate, but re-checking here
-    means a token from a user in no group (policy misconfiguration, stale
-    binding, groups scope accidentally removed) can never provision a local
-    account. Missing/malformed ``groups`` counts as no groups.
+    Access control is the Authentik application policy's job (odysseus-access
+    allows any active authentik user as of 2026-11-11); this function only
+    maps the verified claims and derives the local role. Admin iff the
+    ``groups`` claim contains SSO_ADMIN_GROUP or the email equals
+    SSO_ADMIN_EMAIL. Missing/malformed ``groups`` simply means non-admin.
     """
     cfg = _get_config()
     email = str(claims.get("email") or "").strip().lower()
@@ -362,8 +362,6 @@ def identity_from_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
     groups = claims.get("groups")
     groups = [str(g).lower() for g in groups] if isinstance(groups, list) else []
     is_admin = (cfg.admin_group in groups) or (email == cfg.admin_email)
-    if not is_admin and not any(g in cfg.user_groups for g in groups):
-        raise SSOError("You are not authorized to use Odysseus")
     return {
         "username": email,
         "email": email,
